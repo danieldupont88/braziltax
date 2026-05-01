@@ -1,0 +1,14 @@
+[project]
+name = "brasiltax"
+version = "0.1.0"
+description = "Calculate Brazilian IRPF taxes from B3 annual consolidated reports"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "openpyxl>=3.1.5",
+  "pandas>=2.2.3",
+  "rich>=14.0.0",
+]
+
+[tool.pyright]
+venvPath = ["**/.venv"]
