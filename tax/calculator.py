@@ -3,21 +3,23 @@ Brazilian IRPF tax calculator — trade-level, based on negociacao reports.
 
 Rules applied (Receita Federal):
 
-  Asset type  | Rate  | Monthly sell exemption
-  ------------|-------|------------------------
-  Ação        | 15%   | Exempt if total month sells ≤ R$20,000
-  FII         | 20%   | None
-  BDR         | 15%   | None
-  ETF (equity)| 15%   | None
+  Asset type  | Rate  | Monthly sell exemption  | Loss pool
+  ------------|-------|-------------------------|--------------------
+  Ação        | 15%   | Exempt if sells ≤ R$20k | Renda Variável (shared)
+  BDR         | 15%   | None                    | Renda Variável (shared)
+  ETF (equity)| 15%   | None                    | Renda Variável (shared)
+  FII         | 20%   | None                    | FII (isolated)
+
+Ação, BDR and ETF losses are cross-compensable (same DARF code 6015).
+FII losses can only offset FII gains.
 
 Cost basis method: preço médio ponderado (weighted average), per Receita Federal.
-Losses can be carried forward within the same asset type and offset future gains.
+Losses are carried forward and offset future gains within the same pool.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 import pandas as pd
 
 MONTHLY_EXEMPTION_ACOES = 20_000.0
@@ -28,6 +30,14 @@ TAX_RATES: dict[str, float] = {
     "BDR": 0.15,
     "ETF": 0.15,
 }
+
+# Assets that share the same loss/gain compensation pool (DARF 6015)
+RENDA_VARIAVEL_POOL = {"Ação", "BDR", "ETF"}
+FII_POOL = {"FII"}
+
+
+def _loss_pool_for(asset_type: str) -> str:
+    return "rv" if asset_type in RENDA_VARIAVEL_POOL else "fii"
 
 
 @dataclass
@@ -86,10 +96,12 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
       - final dict of TickerState (current positions with avg cost)
       - list of TickerSellRecord (one per sell row, for per-ticker reporting)
 
-    Loss carry-forward is tracked per asset type.
+    Loss pools:
+      "rv"  — Ação + BDR + ETF (cross-compensable, DARF 6015)
+      "fii" — FII only
     """
     states: dict[str, TickerState] = {}
-    loss_pool: dict[str, float] = {t: 0.0 for t in TAX_RATES}
+    loss_pool: dict[str, float] = {"rv": 0.0, "fii": 0.0}
 
     df = df.copy()
     df["YearMonth"] = df["Data"].dt.to_period("M")
@@ -103,9 +115,9 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
 
     for period, month_df in df.groupby("YearMonth"):
         month_stats: dict[str, dict] = {}
-        # Collect per-ticker sell records for this month before applying exemption logic
         month_ticker_records: list[TickerSellRecord] = []
 
+        # Pass 1: accumulate buys/sells, collect raw per-ticker records
         for _, row in month_df.iterrows():
             ticker = row["Ticker"]
             asset_type = row["Tipo de Ativo"]
@@ -116,13 +128,12 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
             if ticker not in states:
                 states[ticker] = TickerState(ticker=ticker, asset_type=asset_type)
 
-            if asset_type not in month_stats:
-                month_stats[asset_type] = {"sell_value": 0.0, "gross_gain": 0.0}
-
             if is_sell:
                 avg_cost_at_sell = states[ticker].avg_cost
                 gain = states[ticker].sell(qty, price)
                 sell_value = qty * price
+                if asset_type not in month_stats:
+                    month_stats[asset_type] = {"sell_value": 0.0, "gross_gain": 0.0}
                 month_stats[asset_type]["sell_value"] += sell_value
                 month_stats[asset_type]["gross_gain"] += gain
                 month_ticker_records.append(TickerSellRecord(
@@ -139,65 +150,115 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
             else:
                 states[ticker].buy(qty, price)
 
-        # Determine classification per asset type for this month
+        # Only emit MonthlyResult rows where there were actual sells
+        if not month_stats:
+            continue
+        #
+        # RV pool (Ação + BDR + ETF):
+        #   1. Ação sells ≤ R$20k are exempt — their losses still enter the RV net
+        #      but their gains do NOT contribute taxable income.
+        #   2. Net RV taxable gain = sum of non-exempt gains + all losses in the pool.
+        #   3. Carry-forward losses are absorbed against the net RV taxable gain.
+        #   4. Remaining taxable gain is split proportionally to each RV asset type
+        #      by its share of the gross non-exempt gains.
+        #
+        # FII pool: isolated, same logic without the exemption step.
+
+        # Separate asset types by pool
+        rv_types = {at: s for at, s in month_stats.items() if _loss_pool_for(at) == "rv"}
+        fii_types = {at: s for at, s in month_stats.items() if _loss_pool_for(at) == "fii"}
+
         month_classification: dict[str, str] = {}
 
-        for asset_type, stats in month_stats.items():
-            sell_value = stats["sell_value"]
-            gross_gain = stats["gross_gain"]
+        def _process_pool(
+            pool_stats: dict[str, dict],
+            pool_key: str,
+            has_exemption: bool,
+        ) -> None:
+            if not pool_stats:
+                return
 
-            if sell_value == 0.0:
-                continue
+            # Step 1: determine exempt status and compute pool net taxable gain
+            exempt_map: dict[str, bool] = {}
+            for at, stats in pool_stats.items():
+                is_exempt = has_exemption and at == "Ação" and stats["sell_value"] <= MONTHLY_EXEMPTION_ACOES
+                exempt_map[at] = is_exempt
 
-            rate = TAX_RATES[asset_type]
-            exempt = False
-            taxable_gain = gross_gain
-            absorbed_loss = 0.0
+            # Net taxable gain for the pool:
+            #   losses always count; exempt gains do NOT (already not taxed)
+            pool_net_taxable = sum(
+                s["gross_gain"] if (s["gross_gain"] < 0 or not exempt_map[at]) else 0.0
+                for at, s in pool_stats.items()
+            )
 
-            # Apply loss carry-forward
-            if gross_gain > 0 and loss_pool[asset_type] > 0:
-                absorbed = min(loss_pool[asset_type], gross_gain)
-                taxable_gain = gross_gain - absorbed
-                loss_pool[asset_type] -= absorbed
-                absorbed_loss = absorbed
+            # Step 2: absorb carry-forward losses against pool net taxable gain
+            absorbed_total = 0.0
+            if pool_net_taxable > 0 and loss_pool[pool_key] > 0:
+                absorbed_total = min(loss_pool[pool_key], pool_net_taxable)
+                loss_pool[pool_key] -= absorbed_total
+            elif pool_net_taxable < 0:
+                loss_pool[pool_key] += abs(pool_net_taxable)
 
-            # Accumulate new losses
-            if gross_gain < 0:
-                loss_pool[asset_type] += abs(gross_gain)
-                taxable_gain = 0.0
+            net_after_cf = max(pool_net_taxable - absorbed_total, 0.0)
 
-            # Monthly R$20k exemption for Ações
-            if asset_type == "Ação" and sell_value <= MONTHLY_EXEMPTION_ACOES:
-                exempt = True
-                taxable_gain = 0.0
+            # Step 3: distribute taxable gain proportionally to non-exempt positive contributors
+            positive_gains = {
+                at: s["gross_gain"]
+                for at, s in pool_stats.items()
+                if s["gross_gain"] > 0 and not exempt_map[at]
+            }
+            total_positive = sum(positive_gains.values())
 
-            tax_due = taxable_gain * rate if taxable_gain > 0 else 0.0
+            for at, stats in pool_stats.items():
+                gross_gain = stats["gross_gain"]
+                sell_value = stats["sell_value"]
+                exempt = exempt_map[at]
+                rate = TAX_RATES[at]
 
-            # Derive classification label for this asset type this month
-            if gross_gain < 0:
-                classification = "Prejuízo"
-            elif exempt:
-                classification = "Isento"
-            elif taxable_gain == 0 and absorbed_loss > 0:
-                classification = "Zerado por prejuízo anterior"
-            elif tax_due > 0:
-                classification = "Ganho tributável"
-            else:
-                classification = "Ganho"
+                if exempt:
+                    if gross_gain < 0:
+                        # Exempt loss — already counted in pool_net_taxable, pool updated above
+                        pass
+                    month_classification[at] = "Isento"
+                    results.append(MonthlyResult(
+                        year=period.year, month=period.month, asset_type=at,
+                        total_sell_value=sell_value, gross_gain=gross_gain,
+                        taxable_gain=0.0, tax_due=0.0, exempt=True,
+                        loss_carried_forward=0.0,
+                    ))
+                    continue
 
-            month_classification[asset_type] = classification
+                if gross_gain < 0:
+                    month_classification[at] = "Prejuízo"
+                    results.append(MonthlyResult(
+                        year=period.year, month=period.month, asset_type=at,
+                        total_sell_value=sell_value, gross_gain=gross_gain,
+                        taxable_gain=0.0, tax_due=0.0, exempt=False,
+                        loss_carried_forward=0.0,
+                    ))
+                    continue
 
-            results.append(MonthlyResult(
-                year=period.year,
-                month=period.month,
-                asset_type=asset_type,
-                total_sell_value=sell_value,
-                gross_gain=gross_gain,
-                taxable_gain=taxable_gain,
-                tax_due=tax_due,
-                exempt=exempt,
-                loss_carried_forward=absorbed_loss,
-            ))
+                # Positive non-exempt gain: attribute share of net_after_cf
+                share = (gross_gain / total_positive) if total_positive > 0 else 0.0
+                taxable_gain = net_after_cf * share
+                absorbed_for_type = gross_gain - taxable_gain
+                tax_due = taxable_gain * rate
+
+                if taxable_gain <= 0:
+                    classification = "Zerado por prejuízo anterior"
+                else:
+                    classification = "Ganho tributável"
+
+                month_classification[at] = classification
+                results.append(MonthlyResult(
+                    year=period.year, month=period.month, asset_type=at,
+                    total_sell_value=sell_value, gross_gain=gross_gain,
+                    taxable_gain=taxable_gain, tax_due=tax_due, exempt=False,
+                    loss_carried_forward=absorbed_for_type,
+                ))
+
+        _process_pool(rv_types, "rv", has_exemption=True)
+        _process_pool(fii_types, "fii", has_exemption=False)
 
         # Annotate ticker records with the month's classification for their asset type
         for rec in month_ticker_records:
