@@ -20,6 +20,7 @@ from rich import box
 from rich.rule import Rule
 
 from parsers.negociacao import load_all_negociacao
+from parsers.events import load_events, apply_events
 from tax.calculator import compute_gains, results_to_df, positions_to_df
 
 console = Console()
@@ -191,6 +192,13 @@ def main() -> None:
     console.print(f"\n[bold]brasiltax[/bold] — lendo negociações de [cyan]{reports_dir}[/cyan]\n")
 
     df_trades = load_all_negociacao(reports_dir)
+
+    events = load_events("events.toml")
+    if events:
+        tickers = sorted({e.ticker for e in events})
+        console.print(f"Eventos corporativos carregados: [cyan]{len(events)}[/cyan] "
+                      f"({', '.join(tickers)})\n")
+        df_trades = apply_events(df_trades, events)
 
     years = sorted(df_trades["Data"].dt.year.unique())
     console.print(f"Operações encontradas: [cyan]{len(df_trades)}[/cyan] trades "

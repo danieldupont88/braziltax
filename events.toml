@@ -1,0 +1,36 @@
+# Corporate events configuration for brasiltax
+#
+# Declare stock splits, reverse splits, and BDR ratio adjustments here.
+# The calculator will apply these to adjust historical quantities and cost basis.
+#
+# Format:
+#   [[events]]
+#   ticker  = "TICKER"   # normalised ticker (no trailing F)
+#   date    = "YYYY-MM-DD"  # date the event took effect (ex-date)
+#   ratio   = N.0        # multiplier applied to quantity (cost per unit is divided by ratio)
+#                        # ratio > 1 = split (more shares, lower price)
+#                        # ratio < 1 = reverse split/grupamento (fewer shares, higher price)
+#   note    = "..."      # optional description
+#
+# Example: a 2:1 split doubles quantity and halves avg cost.
+# Example: a 0.5 ratio (1:2 grupamento) halves quantity and doubles avg cost.
+#
+# To find events: check B3 "Eventos Corporativos" at
+#   https://sistemaswebb3-listados.b3.com.br/corporateEventsProxy
+# or Status Invest / Fundamentus for each ticker.
+
+# ── NVDC34 (NVIDIA BDR) ──────────────────────────────────────────────────────
+# NVIDIA 10:1 stock split, effective 2024-06-10
+[[events]]
+ticker = "NVDC34"
+date   = "2024-06-10"
+ratio  = 10.0
+note   = "NVIDIA 10:1 stock split"
+
+# B3 BDR ratio adjustment for NVDC34: 3.5:1 (combined with above gives 35x total)
+# Approximate date — confirm at B3 eventos corporativos if needed
+[[events]]
+ticker = "NVDC34"
+date   = "2024-06-10"
+ratio  = 3.5
+note   = "B3 BDR ratio adjustment for NVDC34 (3.5x)"
