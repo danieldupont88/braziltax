@@ -19,8 +19,10 @@ Brazilian IRPF tax calculator for B3 investors. Reads your trade history from B3
 ```
 brasiltax/
 ├── main.py                  # Entry point
+├── events.toml              # Corporate events config (splits, BDR ratio changes)
 ├── parsers/
-│   └── negociacao.py        # Parses negociacao-*.xlsx trade reports
+│   ├── negociacao.py        # Parses negociacao-*.xlsx trade reports
+│   └── events.py            # Loads and applies corporate events to trade history
 ├── tax/
 │   └── calculator.py        # Preço médio ponderado + Brazilian tax rules
 ├── reports/                 # Drop your .xlsx files here (gitignored)
@@ -31,16 +33,17 @@ brasiltax/
 
 ## Requirements
 
-- Python 3.13+
+- Python 3.9+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
 
 Dependencies (declared in `pyproject.toml`):
 
-| Package    | Purpose                        |
-|------------|-------------------------------|
-| `pandas`   | Data manipulation              |
-| `openpyxl` | Reading `.xlsx` files          |
-| `rich`     | Terminal output formatting     |
+| Package    | Purpose                                        |
+|------------|------------------------------------------------|
+| `pandas`   | Data manipulation                              |
+| `openpyxl` | Reading `.xlsx` files                          |
+| `rich`     | Terminal output formatting                     |
+| `tomli`    | TOML parsing on Python < 3.11 (auto-installed) |
 
 ---
 
@@ -59,7 +62,7 @@ uv sync
 cd brasiltax
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install pandas openpyxl rich
+pip install pandas openpyxl rich "tomli; python_version<'3.11'"
 ```
 
 ---
@@ -143,6 +146,53 @@ Fracionário tickers (`BBAS3F`, `ITSA4F`) are normalised to their base ticker
 
 To add a missing ETF to the classification list, edit the `KNOWN_ETFS` set in
 `parsers/negociacao.py`.
+
+---
+
+## Corporate events (splits and BDR ratio changes)
+
+Stock splits and BDR ratio adjustments are declared in `events.toml`. When an
+event is present, all buys for that ticker **before** the event date are
+retroactively adjusted — quantity is multiplied by the ratio and price is
+divided by it — so the total acquisition cost is preserved and cost basis
+remains correct.
+
+### events.toml format
+
+```toml
+[[events]]
+ticker = "NVDC34"
+date   = "2024-06-10"
+ratio  = 10.0
+note   = "NVIDIA 10:1 stock split"
+
+[[events]]
+ticker = "NVDC34"
+date   = "2024-06-10"
+ratio  = 3.5
+note   = "B3 BDR ratio adjustment for NVDC34 (3.5x)"
+```
+
+| Field    | Description                                                                 |
+|----------|-----------------------------------------------------------------------------|
+| `ticker` | Normalised ticker (no trailing `F`)                                         |
+| `date`   | Ex-date of the event (`YYYY-MM-DD`)                                         |
+| `ratio`  | Multiplier: `> 1` = split (more shares), `< 1` = reverse split (grupamento)|
+| `note`   | Optional description                                                        |
+
+Multiple events for the same ticker are applied in chronological order.
+
+**Where to find corporate events:**  
+B3 Eventos Corporativos: `https://sistemaswebb3-listados.b3.com.br/corporateEventsProxy`  
+Or search `<TICKER> desdobramento` / `<TICKER> grupamento` on Status Invest or Fundamentus.
+
+### Why this matters
+
+Without split adjustments, historical buys appear to have a zero or inflated
+cost basis, producing incorrect gains/losses. Example: 6 NVDC34 BDRs bought in
+2021 became 210 after a combined 35x adjustment (NVIDIA 10:1 stock split ×
+3.5x B3 BDR ratio change). Without the adjustment, the Nov 2025 sell appeared
+as a R$7,801 loss; with it, the correct R$4,173 gain and R$626 DARF are shown.
 
 ---
 
