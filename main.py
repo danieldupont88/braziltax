@@ -21,7 +21,7 @@ from rich.rule import Rule
 
 from parsers.negociacao import load_all_negociacao
 from parsers.events import load_events, apply_events
-from tax.calculator import compute_gains, results_to_df, positions_to_df
+from tax.calculator import compute_gains, results_to_df, positions_to_df, ticker_records_to_df, export_yearly_reports
 
 console = Console()
 MONTH_NAMES = [calendar.month_abbr[i] for i in range(1, 13)]
@@ -204,7 +204,7 @@ def main() -> None:
     console.print(f"Operações encontradas: [cyan]{len(df_trades)}[/cyan] trades "
                   f"| Anos: [cyan]{', '.join(str(y) for y in years)}[/cyan]\n")
 
-    results, states = compute_gains(df_trades)
+    results, states, ticker_records = compute_gains(df_trades)
     df_results = results_to_df(results)
     df_positions = positions_to_df(states)
 
@@ -212,6 +212,12 @@ def main() -> None:
     print_monthly_table(df_results)
     print_positions(df_positions)
     print_next_steps(df_results)
+
+    written = export_yearly_reports(ticker_records)
+    if written:
+        console.print(Rule("[bold]Relatórios gerados[/bold]"))
+        for path in written:
+            console.print(f"  [green]✓[/green] {path}")
 
 
 if __name__ == "__main__":

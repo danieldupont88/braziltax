@@ -53,6 +53,20 @@ class TickerState:
 
 
 @dataclass
+class TickerSellRecord:
+    year: int
+    month: int
+    ticker: str
+    asset_type: str
+    qty_sold: float = 0.0
+    avg_cost: float = 0.0
+    sell_price: float = 0.0
+    sell_value: float = 0.0
+    gross_gain: float = 0.0
+    classification: str = ""
+
+
+@dataclass
 class MonthlyResult:
     year: int
     month: int
@@ -65,16 +79,16 @@ class MonthlyResult:
     loss_carried_forward: float = 0.0   # loss absorbed from prior months
 
 
-def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, TickerState]]:
+def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, TickerState], list[TickerSellRecord]]:
     """
     Process all trades chronologically and return:
-      - list of MonthlyResult (one per year/month/asset_type combination with activity)
+      - list of MonthlyResult (one per year/month/asset_type with sell activity)
       - final dict of TickerState (current positions with avg cost)
+      - list of TickerSellRecord (one per sell row, for per-ticker reporting)
 
     Loss carry-forward is tracked per asset type.
     """
     states: dict[str, TickerState] = {}
-    # Accumulated losses per asset type (positive number = loss owed to investor)
     loss_pool: dict[str, float] = {t: 0.0 for t in TAX_RATES}
 
     df = df.copy()
@@ -85,10 +99,12 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
     df.drop(columns=["_sort_key"], inplace=True)
 
     results: list[MonthlyResult] = []
+    ticker_records: list[TickerSellRecord] = []
 
     for period, month_df in df.groupby("YearMonth"):
-        # Collect per-asset-type stats for this month
         month_stats: dict[str, dict] = {}
+        # Collect per-ticker sell records for this month before applying exemption logic
+        month_ticker_records: list[TickerSellRecord] = []
 
         for _, row in month_df.iterrows():
             ticker = row["Ticker"]
@@ -104,11 +120,27 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
                 month_stats[asset_type] = {"sell_value": 0.0, "gross_gain": 0.0}
 
             if is_sell:
+                avg_cost_at_sell = states[ticker].avg_cost
                 gain = states[ticker].sell(qty, price)
-                month_stats[asset_type]["sell_value"] += qty * price
+                sell_value = qty * price
+                month_stats[asset_type]["sell_value"] += sell_value
                 month_stats[asset_type]["gross_gain"] += gain
+                month_ticker_records.append(TickerSellRecord(
+                    year=period.year,
+                    month=period.month,
+                    ticker=ticker,
+                    asset_type=asset_type,
+                    qty_sold=qty,
+                    avg_cost=avg_cost_at_sell,
+                    sell_price=price,
+                    sell_value=sell_value,
+                    gross_gain=gain,
+                ))
             else:
                 states[ticker].buy(qty, price)
+
+        # Determine classification per asset type for this month
+        month_classification: dict[str, str] = {}
 
         for asset_type, stats in month_stats.items():
             sell_value = stats["sell_value"]
@@ -141,6 +173,20 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
 
             tax_due = taxable_gain * rate if taxable_gain > 0 else 0.0
 
+            # Derive classification label for this asset type this month
+            if gross_gain < 0:
+                classification = "Prejuízo"
+            elif exempt:
+                classification = "Isento"
+            elif taxable_gain == 0 and absorbed_loss > 0:
+                classification = "Zerado por prejuízo anterior"
+            elif tax_due > 0:
+                classification = "Ganho tributável"
+            else:
+                classification = "Ganho"
+
+            month_classification[asset_type] = classification
+
             results.append(MonthlyResult(
                 year=period.year,
                 month=period.month,
@@ -153,7 +199,12 @@ def compute_gains(df: pd.DataFrame) -> tuple[list[MonthlyResult], dict[str, Tick
                 loss_carried_forward=absorbed_loss,
             ))
 
-    return results, states
+        # Annotate ticker records with the month's classification for their asset type
+        for rec in month_ticker_records:
+            rec.classification = month_classification.get(rec.asset_type, "")
+            ticker_records.append(rec)
+
+    return results, states, ticker_records
 
 
 def results_to_df(results: list[MonthlyResult]) -> pd.DataFrame:
@@ -174,6 +225,54 @@ def results_to_df(results: list[MonthlyResult]) -> pd.DataFrame:
         for r in results
     ]
     return pd.DataFrame(rows)
+
+
+def ticker_records_to_df(records: list[TickerSellRecord]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame([
+        {
+            "Ano": r.year,
+            "Mês": r.month,
+            "Ticker": r.ticker,
+            "Tipo de Ativo": r.asset_type,
+            "Qtd Vendida": r.qty_sold,
+            "Preço Médio Custo (R$)": r.avg_cost,
+            "Preço de Venda (R$)": r.sell_price,
+            "Total Vendido (R$)": r.sell_value,
+            "Ganho/Perda Bruto (R$)": r.gross_gain,
+            "Classificação": r.classification,
+        }
+        for r in records
+    ])
+
+
+def export_yearly_reports(records: list[TickerSellRecord], output_dir: str = "output") -> list[str]:
+    """
+    Write one Excel file per year to output_dir.
+    Returns list of file paths written.
+    """
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    df = ticker_records_to_df(records)
+    if df.empty:
+        return []
+
+    written = []
+    for year, year_df in df.groupby("Ano"):
+        path = os.path.join(output_dir, f"brasiltax-{year}.xlsx")
+        year_df = year_df.drop(columns=["Ano"]).reset_index(drop=True)
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:
+            year_df.to_excel(writer, index=False, sheet_name="Operações de Venda")
+            # Auto-fit column widths
+            ws = writer.sheets["Operações de Venda"]
+            for col in ws.columns:
+                max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+                ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 40)
+        written.append(path)
+
+    return written
 
 
 def positions_to_df(states: dict[str, TickerState]) -> pd.DataFrame:
